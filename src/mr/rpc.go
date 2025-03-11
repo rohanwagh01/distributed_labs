@@ -1,29 +1,48 @@
 package mr
 
 //
-// RPC definitions.
+// RPC definitions. DONE
 //
 // remember to capitalize all names.
 //
 
-import "os"
-import "strconv"
+import (
+	"os"
+	"strconv"
+)
 
-//
-// example to show how to declare the arguments
-// and reply for an RPC.
-//
+// Consts for tasks
+type TaskType int
 
-type ExampleArgs struct {
-	X int
+const (
+	TaskTypeMap    TaskType = 0
+	TaskTypeReduce TaskType = 1
+	TaskTypeWait   TaskType = 3
+	TaskTypeStop   TaskType = 4
+)
+
+//REQUEST WORK RPC
+
+type RequestWorkArgs struct { //doesn't need to send anything to request work
 }
 
-type ExampleReply struct {
-	Y int
+type RequestWorkReply struct { //should not actually have to return anything to the worker i think?
+	TypeOfTask TaskType
+	PTask      *Task
+	//ID         int    //Task ID number (can overlap with map or reduce tasks as stored in different taskArrays)
+	//Location   string //Location where the task is either reading from (mapTask), might be "" for a reducetask just cause i will use internal documentation
+	//Nfiles     int
 }
 
-// Add your RPC definitions here.
+//WORK COMPLETE RPC
 
+type WorkCompleteArgs struct {
+	CompletedTaskID int
+	TypeOfTask      TaskType
+}
+
+type WorkCompleteReply struct { //should not actually have to return anything to the worker i think?
+}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.
