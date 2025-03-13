@@ -10,6 +10,7 @@ import (
 	//  "bytes"
 
 	"bytes"
+	"fmt"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -188,9 +189,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.commitIndex = min(args.LeaderCommit, len(rf.Log)-1)
 		}
 
-		rf.updateClient()
-
 		reply.Success = true
+
+		rf.updateClient()
 
 	// mismatch at this spot
 	default:
@@ -370,6 +371,9 @@ func (rf *Raft) handleCommandUpdate(server int, responseChannel chan bool, wg *s
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	if rf.nextIndex[server] > len(rf.Log) {
+		fmt.Println("next index got too large")
+	}
 	args := AppendEntriesArgs{
 		Term:         rf.CurrentTerm,
 		LeaderID:     rf.me,
@@ -509,7 +513,9 @@ func (rf *Raft) updateClient() {
 			Command:      rf.Log[i].LogContent,
 			CommandIndex: i, // logs are 1 indexed
 		}
+		rf.mu.Unlock()
 		rf.channel <- msg
+		rf.mu.Lock()
 		//fmt.Println("       ", rf.me, "sending commands to client: ", i)
 		rf.lastApplied = i
 	}
