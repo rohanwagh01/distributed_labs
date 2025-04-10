@@ -56,6 +56,7 @@ type Raft struct {
 	CurrentTerm int        // the term that this instance thinks is its in
 	VotedFor    int        // peer that secureed vote for the term listed in currentTerm
 	Log         []LogEntry //
+	Snap        SnapShot   //
 
 	commitIndex int       // index of the higher log entry known to be committed
 	lastApplied int       // index of highest log entry applied to state machine
@@ -69,7 +70,30 @@ type LogEntry struct {
 	LogContent interface{}
 }
 
+type SnapShot struct {
+	Snap      []byte //
+	LastTerm  int    //
+	LastIndex int    //
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////       Struct Handlers         ///////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+func (rf *Raft) logLength() int {
+	return len(rf.Log) + rf.Snap.LastIndex
+}
+
+func (rf *Raft) get(i int) *LogEntry {
+	index := i - rf.Snap.LastIndex
+	if index < 0 || index > len(rf.Log) {
+		fmt.Println("improper log access with index: ", i, "snapshot size: ", rf.Snap.LastIndex, " and log length: ", len(rf.Log))
+		return nil
+	}
+	return &rf.Log[index]
+}
+
+///////////////////////s/////////////////////////////////////////////////////////////////////////////////////
 ///////////////////////////////////////////        RPCs      ///////////////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -126,8 +150,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	// vote for the incoming request if possible, otherwise ignore  |  possible if vote is available and candidate has an up to date log or if already voted for the candidate
-	lastLogTerm := rf.Log[len(rf.Log)-1].TermAdded
-	candidateLogUpToDate := args.LastLogTerm > lastLogTerm || (args.LastLogTerm == lastLogTerm && args.LastLogIndex >= len(rf.Log)-1)
+	//lastLogTerm := rf.Log[len(rf.Log)-1].TermAdded
+	//candidateLogUpToDate := args.LastLogTerm > lastLogTerm || (args.LastLogTerm == lastLogTerm && args.LastLogIndex >= len(rf.Log)-1)
+	lastLogTerm := rf.get(len(rf.Log) - 1).TermAdded
+	candidateLogUpToDate := args.LastLogTerm > lastLogTerm || (args.LastLogTerm == lastLogTerm && args.LastLogIndex >= rf.logLength()-1)
 
 	if (rf.VotedFor == -1 || rf.VotedFor == args.CandidateID) && candidateLogUpToDate {
 
@@ -167,26 +193,28 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	rf.status = FOLLOWER
+
 	switch {
 	// check if short log
-	case args.PrevLogIndex >= len(rf.Log):
+	case args.PrevLogIndex >= rf.logLength():
 		//fmt.Println("short log", rf.me)
 		reply.XLogTerm = -1
-		reply.XLogLength = len(rf.Log)
+		reply.XLogLength = rf.logLength()
 		reply.Success = false
 
 	// logs match
-	case rf.Log[args.PrevLogIndex].TermAdded == args.PrevLogTerm:
+	//case rf.Log[args.PrevLogIndex].TermAdded == args.PrevLogTerm:
+	case rf.get(args.PrevLogIndex).TermAdded == args.PrevLogTerm:
 
 		// append and new entries not already in log from prevlogindex onwards
-		rf.updateState(rf.CurrentTerm, rf.VotedFor, append(rf.Log[:args.PrevLogIndex+1], args.Entries...))
-		if len(args.Entries) > 0 {
-			//fmt.Println(rf.me, " added command to log: ", rf.Log)
+		rf.updateState(rf.CurrentTerm, rf.VotedFor, append(rf.Log[:args.PrevLogIndex+1-rf.Snap.LastIndex], args.Entries...))
+		if args.PrevLogIndex < rf.lastApplied {
+			//fmt.Println("happened at prev index: ", args.PrevLogIndex, "and last applied:", rf.lastApplied, rf.Log, "with entries: ", len(args.Entries), args.Entries)
 		}
 
 		// update commit if the leader commit is larger
 		if args.LeaderCommit > rf.commitIndex {
-			rf.commitIndex = min(args.LeaderCommit, len(rf.Log)-1)
+			rf.commitIndex = min(args.LeaderCommit, rf.logLength()-1)
 		}
 
 		reply.Success = true
@@ -196,13 +224,20 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// mismatch at this spot
 	default:
 		//fmt.Println("incorrect log", rf.me)
-		reply.XLogTerm = rf.Log[args.PrevLogIndex].TermAdded
+		//reply.XLogTerm = rf.Log[args.PrevLogIndex].TermAdded
 
-		reply.Success = false
-		reply.Term = rf.CurrentTerm
+		if rf.lastApplied < args.PrevLogIndex && rf.get(rf.lastApplied).TermAdded == rf.get(args.PrevLogIndex).TermAdded {
+			reply.XLogTerm = -1
+			reply.XLogLength = rf.lastApplied + 1
+			reply.Success = false
+		} else {
+			reply.XLogTerm = rf.get(args.PrevLogIndex).TermAdded
+			reply.Success = false
+			reply.Term = rf.CurrentTerm
+		}
 
 		// delete excess log
-		rf.updateState(rf.CurrentTerm, rf.VotedFor, rf.Log[:args.PrevLogIndex])
+		rf.updateState(rf.CurrentTerm, rf.VotedFor, rf.Log[:args.PrevLogIndex-rf.Snap.LastIndex])
 	}
 }
 
@@ -218,7 +253,6 @@ Start an election process. Updates to candidate and requests a vote from each pe
 */
 func (rf *Raft) startElection() {
 	rf.mu.Lock()
-
 	// increase the term and promote to candidate
 	rf.status = CANDIDATE
 	rf.updateState(rf.CurrentTerm+1, rf.me, rf.Log)
@@ -227,30 +261,14 @@ func (rf *Raft) startElection() {
 	// start election and timer
 	rf.timeLastMSG = time.Now()
 
-	// unblock for handleVote routines
+	votes := 1
 	rf.mu.Unlock()
-
-	majority := rf.applyFuncUntilMajority(rf.handleVote, rf.abortElection)
-
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	if majority && rf.CurrentTerm == electionTerm && rf.status == CANDIDATE {
-		rf.status = LEADER
-		//fmt.Println(rf.me, "is leader")
-		for i := range rf.peers {
-			rf.nextIndex[i] = len(rf.Log)
-			rf.matchIndex[i] = 0
+	// request a vote from each peer
+	for i := 0; i < len(rf.peers); i++ {
+		if i != rf.me {
+			go rf.handleVote(i, &votes, electionTerm)
 		}
-		go rf.heartBeats(rf.CurrentTerm)
 	}
-}
-
-// MUST HOLD LOCK TO USE
-func (rf *Raft) abortElection() bool {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	return rf.status != CANDIDATE || rf.killed()
 }
 
 /*
@@ -263,27 +281,37 @@ Sends a requestVote RPC to a peer and waits for response. Sends down the vote do
 		- wg: updates waitgroup once the function completes
 	Mutability: Reverts to follower if out of term.
 */
-func (rf *Raft) handleVote(server int, responseChannel chan bool, wg *sync.WaitGroup) {
-	defer wg.Done()
-
+func (rf *Raft) handleVote(server int, votes *int, electionTerm int) {
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
 
 	args := RequestVoteArgs{}
 	reply := RequestVoteReply{}
 
 	args.CandidateID = rf.me
 	args.Term = rf.CurrentTerm
-	args.LastLogIndex = len(rf.Log) - 1
-	args.LastLogTerm = rf.Log[args.LastLogIndex].TermAdded
+	args.LastLogIndex = rf.logLength() - 1
+	args.LastLogTerm = rf.get(args.LastLogIndex).TermAdded
 
 	// send requests until successful
 	rf.mu.Unlock()
 	ok := rf.sendTCP(server, "Raft.RequestVote", &args, &reply)
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
-	responseChannel <- ok && reply.VoteGranted && rf.status == CANDIDATE
+	if ok && reply.VoteGranted && rf.status == CANDIDATE && rf.CurrentTerm == electionTerm {
+		*votes += 1
 
+		//majority
+		if *votes > len(rf.peers)/2 {
+			rf.status = LEADER
+			//fmt.Println(rf.me, "is leader")
+			for i := range rf.peers {
+				rf.nextIndex[i] = rf.logLength()
+				rf.matchIndex[i] = 0
+			}
+			go rf.heartBeats(rf.CurrentTerm)
+		}
+	}
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -315,7 +343,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) { //3B
 	rf.updateState(rf.CurrentTerm, rf.VotedFor, append(rf.Log, newEntry))
 	//fmt.Println("   ", rf.me, "added command to log: ", rf.Log)
 
-	entryIndex := len(rf.Log) - 1
+	entryIndex := rf.logLength() - 1
 
 	//fmt.Println(rf.me, "sending command", len(rf.Log))
 
@@ -371,15 +399,16 @@ func (rf *Raft) handleCommandUpdate(server int, responseChannel chan bool, wg *s
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	if rf.nextIndex[server] > len(rf.Log) {
+	if rf.nextIndex[server] > rf.logLength() {
 		fmt.Println("next index got too large")
+		rf.nextIndex[server] = rf.logLength()
 	}
 	args := AppendEntriesArgs{
 		Term:         rf.CurrentTerm,
 		LeaderID:     rf.me,
 		PrevLogIndex: rf.nextIndex[server] - 1,
-		PrevLogTerm:  rf.Log[rf.nextIndex[server]-1].TermAdded,
-		Entries:      rf.Log[rf.nextIndex[server]:], //XXX seems like entries can grow larger than the size of the log
+		PrevLogTerm:  rf.get(rf.nextIndex[server] - 1).TermAdded,
+		Entries:      rf.Log[rf.nextIndex[server]-rf.Snap.LastIndex:], //XXX seems like entries can grow larger than the size of the log
 		LeaderCommit: rf.commitIndex,
 	}
 
@@ -394,8 +423,8 @@ func (rf *Raft) handleCommandUpdate(server int, responseChannel chan bool, wg *s
 		if !ok || rf.status != LEADER || args.Term != rf.CurrentTerm || rf.killed() {
 			return
 		} else if reply.Success {
-			rf.nextIndex[server] = len(rf.Log)
-			rf.matchIndex[server] = len(rf.Log) - 1
+			rf.nextIndex[server] = rf.logLength()
+			rf.matchIndex[server] = rf.logLength() - 1
 			responseChannel <- reply.Success
 			return
 		}
@@ -405,14 +434,14 @@ func (rf *Raft) handleCommandUpdate(server int, responseChannel chan bool, wg *s
 		} else {
 			// find the first entry of highest term < XTerm
 			nextIndex := max(rf.nextIndex[server]-1, 1)
-			for i := rf.nextIndex[server] - 1; i > 0 && rf.Log[i].TermAdded >= reply.XLogTerm; i-- {
+			for i := rf.nextIndex[server] - 1; i > 0 && rf.get(i).TermAdded >= reply.XLogTerm; i-- {
 				nextIndex = i
 			}
 			rf.nextIndex[server] = nextIndex
 		}
 		args.PrevLogIndex = rf.nextIndex[server] - 1
-		args.PrevLogTerm = rf.Log[rf.nextIndex[server]-1].TermAdded
-		args.Entries = rf.Log[rf.nextIndex[server]:]
+		args.PrevLogTerm = rf.get(rf.nextIndex[server] - 1).TermAdded
+		args.Entries = rf.Log[rf.nextIndex[server]-rf.Snap.LastIndex:]
 	}
 }
 
@@ -505,19 +534,19 @@ Updates the client of all log contents from after last applied to the commit ind
 
 	Mutability: updates lastApplied if logs committed
 */
+
+// XXX make this a routine and have some way to send a command to send down the channel to send it out
 func (rf *Raft) updateClient() {
 	//apply the changes to our client
 	for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
 		msg := raftapi.ApplyMsg{
 			CommandValid: true,
-			Command:      rf.Log[i].LogContent,
+			Command:      rf.get(i).LogContent,
 			CommandIndex: i, // logs are 1 indexed
 		}
-		rf.mu.Unlock()
-		rf.channel <- msg
-		rf.mu.Lock()
-		//fmt.Println("       ", rf.me, "sending commands to client: ", i)
 		rf.lastApplied = i
+		rf.channel <- msg
+		//fmt.Println("       ", rf.me, "sending commands to client: ", i)
 	}
 }
 
@@ -658,6 +687,8 @@ Applies a given function for each server peer except for the sender server. Wait
 		- true if majority of the functions responded with true
 		- false if the majority was not acheived or if the function aborted early
 */
+
+// remake to just be something that is handled in each responder, use a pointer to an int protected by the raft lock and have each handler do the end conditions.
 func (rf *Raft) applyFuncUntilMajority(responseHandler func(int, chan bool, *sync.WaitGroup), abort func() bool) bool {
 	responseCh := make(chan bool, len(rf.peers))
 	voteCount := 1
